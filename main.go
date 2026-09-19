@@ -1,13 +1,18 @@
 // sshfm is a transparent ssh pty proxy: it forwards every byte between the
 // real terminal and a real `ssh` child process untouched, so it behaves
 // exactly like plain ssh, except it watches for one sequence - Enter, then
-// `~f` - which pops a real `sftp` session (reusing a hidden background
-// connection opened at startup) and hands the terminal back to ssh the
-// moment sftp exits.
+// `~f` - which pops a real `sftp` session and hands the terminal back to
+// ssh the moment sftp exits.
+//
+// The visible session is itself the ControlMaster, and sftp attaches to it
+// as a multiplexed client. That means one connection and one authentication
+// for both, so a password host prompts once. Making the session the master
+// rather than a client of a separate hidden connection also keeps ssh's own
+// escape sequences intact: a master owns its transport so it can still
+// suspend (`~^Z`) and background (`~&`) itself, which a mux client cannot.
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -16,7 +21,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/creack/pty"
@@ -36,10 +40,23 @@ func main() {
 		_ = syscall.Exec(sshPath, []string{"ssh"}, os.Environ())
 	}
 
-	host := sshArgs[len(sshArgs)-1]
-	sockPath, masterErr := startMaster(sshArgs)
+	sockPath, sockErr := socketPath()
 
-	cmd := exec.Command("ssh", sshArgs...)
+	// Make the visible session the master so sftp can ride the same
+	// connection. All three options are pinned explicitly rather than left
+	// to ssh_config: a host configured with `ControlMaster yes` would
+	// otherwise find the socket taken and silently drop multiplexing, and
+	// a configured ControlPersist would leave the master lingering in the
+	// background after the session ends.
+	visibleArgs := sshArgs
+	if sockPath != "" {
+		visibleArgs = append([]string{
+			"-o", "ControlMaster=yes",
+			"-o", "ControlPath=" + sockPath,
+			"-o", "ControlPersist=no",
+		}, sshArgs...)
+	}
+	cmd := exec.Command("ssh", visibleArgs...)
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sshfm: failed to start ssh:", err)
@@ -76,11 +93,15 @@ func main() {
 		close(copyDone)
 	}()
 
-	go processStdin(ptmx, sockPath, masterErr, sshArgs, host, &oldState)
+	go processStdin(ptmx, sockPath, sockErr, sshArgs, &oldState)
 
 	waitErr := cmd.Wait()
 	restoreTerm()
-	stopMaster(sockPath, host)
+	// ssh removes the socket itself on a clean exit; this only catches the
+	// case where it was killed before it could.
+	if sockPath != "" {
+		_ = os.Remove(sockPath)
+	}
 
 	exitCode := 0
 	if waitErr != nil {
@@ -93,51 +114,16 @@ func main() {
 	os.Exit(exitCode)
 }
 
-// startMaster opens a hidden background ControlMaster connection purely for
-// sftp to reuse, keyed to this process's pid so it can't collide with
-// sshfm instances in other terminals. Runs before the visible session's
-// pty/raw-mode setup, so its stdio is still the plain original terminal -
-// intentionally NOT BatchMode, so if the host needs a password (or an
-// unrecognized host key), the normal ssh prompt appears right here and
-// works exactly like typing the command directly. StrictHostKeyChecking=
-// accept-new still avoids a redundant prompt for a first-time host.
-func startMaster(sshArgs []string) (string, string) {
+// socketPath picks a control socket for this session, keyed to this
+// process's pid so it can't collide with sshfm instances in other
+// terminals. Returns a reason instead when the directory is unusable, in
+// which case the session still runs, just without the sftp hotkey.
+func socketPath() (string, string) {
 	sockDir := filepath.Join(os.Getenv("HOME"), ".ssh", "sockets")
 	if err := os.MkdirAll(sockDir, 0o700); err != nil {
 		return "", err.Error()
 	}
-	sockPath := filepath.Join(sockDir, fmt.Sprintf("sshfm-%d-%s", os.Getpid(), randHex(4)))
-
-	args := []string{
-		"-o", "ControlMaster=yes",
-		"-o", "ControlPersist=10m",
-		"-o", "ControlPath=" + sockPath,
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-fN",
-	}
-	args = append(args, sshArgs...)
-
-	var stderr bytes.Buffer
-	cmd := exec.Command("ssh", args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
-		}
-		return "", msg
-	}
-	return sockPath, ""
-}
-
-func stopMaster(sockPath, host string) {
-	if sockPath == "" {
-		return
-	}
-	cmd := exec.Command("ssh", "-o", "ControlPath="+sockPath, "-O", "exit", host)
-	_ = cmd.Run()
+	return filepath.Join(sockDir, fmt.Sprintf("sshfm-%d-%s", os.Getpid(), randHex(4))), ""
 }
 
 // sftpArgs translates ssh's `-p PORT` flag to sftp/scp's `-P PORT` - the one
@@ -165,7 +151,7 @@ func randHex(n int) string {
 // sequence "\n~f" (matching ssh's own escape-key convention but never
 // forwarded to ssh, so it isn't subject to ssh's restrictions on escapes
 // during ControlMaster use), which triggers runSFTP instead.
-func processStdin(ptmx *os.File, sockPath, masterErr string, sshArgs []string, host string, oldState **term.State) {
+func processStdin(ptmx *os.File, sockPath, sockErr string, sshArgs []string, oldState **term.State) {
 	buf := make([]byte, 4096)
 	state := 1 // 1 == start-of-line; matches ssh treating session start as eligible too
 	var out []byte
@@ -202,7 +188,7 @@ func processStdin(ptmx *os.File, sockPath, masterErr string, sshArgs []string, h
 						_, _ = ptmx.Write(out)
 						out = out[:0]
 					}
-					runSFTP(sockPath, masterErr, sshArgs, host, oldState)
+					runSFTP(sockPath, sockErr, sshArgs, oldState)
 					state = 1
 				case b == '\r' || b == '\n':
 					out = append(out, '~', b)
@@ -219,13 +205,15 @@ func processStdin(ptmx *os.File, sockPath, masterErr string, sshArgs []string, h
 	}
 }
 
-func runSFTP(sockPath, masterErr string, sshArgs []string, host string, oldState **term.State) {
+func runSFTP(sockPath, sockErr string, sshArgs []string, oldState **term.State) {
 	if *oldState != nil {
 		_ = term.Restore(int(os.Stdin.Fd()), *oldState)
 	}
 
 	if sockPath == "" {
-		fmt.Fprintf(os.Stdout, "\r\n[sshfm] sftp unavailable (background connection failed): %s\r\n", masterErr)
+		fmt.Fprintf(os.Stdout, "\r\n[sshfm] sftp unavailable: %s\r\n", sockErr)
+	} else if _, err := os.Stat(sockPath); err != nil {
+		os.Stdout.WriteString("\r\n[sshfm] sftp unavailable: no control socket yet\r\n")
 	} else {
 		args := append([]string{"-o", "ControlPath=" + sockPath}, sftpArgs(sshArgs)...)
 		cmd := exec.Command("sftp", args...)
