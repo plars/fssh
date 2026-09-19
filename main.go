@@ -1,4 +1,4 @@
-// sshfm is a transparent ssh pty proxy: it forwards every byte between the
+// fssh is a transparent ssh pty proxy: it forwards every byte between the
 // real terminal and a real `ssh` child process untouched, so it behaves
 // exactly like plain ssh, except it watches for one sequence - Enter, then
 // `~f` - which pops a real `sftp` session and hands the terminal back to
@@ -34,7 +34,7 @@ func main() {
 	if len(sshArgs) == 0 {
 		sshPath, err := exec.LookPath("ssh")
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "sshfm: ssh not found in PATH")
+			fmt.Fprintln(os.Stderr, "fssh: ssh not found in PATH")
 			os.Exit(127)
 		}
 		_ = syscall.Exec(sshPath, []string{"ssh"}, os.Environ())
@@ -59,7 +59,7 @@ func main() {
 	cmd := exec.Command("ssh", visibleArgs...)
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "sshfm: failed to start ssh:", err)
+		fmt.Fprintln(os.Stderr, "fssh: failed to start ssh:", err)
 		os.Exit(1)
 	}
 	defer ptmx.Close()
@@ -115,7 +115,7 @@ func main() {
 }
 
 // socketPath picks a control socket for this session, keyed to this
-// process's pid so it can't collide with sshfm instances in other
+// process's pid so it can't collide with fssh instances in other
 // terminals. Returns a reason instead when the directory is unusable, in
 // which case the session still runs, just without the sftp hotkey.
 func socketPath() (string, string) {
@@ -123,7 +123,7 @@ func socketPath() (string, string) {
 	if err := os.MkdirAll(sockDir, 0o700); err != nil {
 		return "", err.Error()
 	}
-	return filepath.Join(sockDir, fmt.Sprintf("sshfm-%d-%s", os.Getpid(), randHex(4))), ""
+	return filepath.Join(sockDir, fmt.Sprintf("fssh-%d-%s", os.Getpid(), randHex(4))), ""
 }
 
 // sftpArgs translates ssh's `-p PORT` flag to sftp/scp's `-P PORT` - the one
@@ -211,9 +211,9 @@ func runSFTP(sockPath, sockErr string, sshArgs []string, oldState **term.State) 
 	}
 
 	if sockPath == "" {
-		fmt.Fprintf(os.Stdout, "\r\n[sshfm] sftp unavailable: %s\r\n", sockErr)
+		fmt.Fprintf(os.Stdout, "\r\n[fssh] sftp unavailable: %s\r\n", sockErr)
 	} else if _, err := os.Stat(sockPath); err != nil {
-		os.Stdout.WriteString("\r\n[sshfm] sftp unavailable: no control socket yet\r\n")
+		os.Stdout.WriteString("\r\n[fssh] sftp unavailable: no control socket yet\r\n")
 	} else {
 		args := append([]string{"-o", "ControlPath=" + sockPath}, sftpArgs(sshArgs)...)
 		cmd := exec.Command("sftp", args...)

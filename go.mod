@@ -1,4 +1,4 @@
-module sshfm
+module fssh
 
 go 1.27.1
 
